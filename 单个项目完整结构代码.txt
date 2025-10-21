@@ -1,0 +1,519 @@
+项目 'teleprompt-2api' 的结构树:
+📂 teleprompt-2api/
+    📄 .env
+    📄 .env.example
+    📄 Dockerfile
+    📄 docker-compose.yml
+    📄 main.py
+    📄 nginx.conf
+    📄 requirements.txt
+    📂 app/
+        📂 core/
+            📄 __init__.py
+            📄 config.py
+        📂 providers/
+            📄 __init__.py
+            📄 base_provider.py
+            📄 teleprompt_provider.py
+        📂 services/
+            📄 credential_manager.py
+        📂 utils/
+            📄 sse_utils.py
+================================================================================
+
+--- 文件路径: .env ---
+
+# ====================================================================
+# teleprompt-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并填入您的配置。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=1
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+# --- Teleprompt 凭证 (必须设置, 支持多账号轮询) ---
+# 请填入您的 email 地址。
+# 要启用多账号轮询，请按格式添加 TELEPROMPT_EMAIL_2, TELEPROMPT_EMAIL_3, ...
+# 程序会自动加载所有以 "TELEPROMPT_EMAIL_" 开头的环境变量。
+TELEPROMPT_EMAIL_1="q13645947407@gmail.com"
+# TELEPROMPT_EMAIL_2="q13645947408@gmail.com"
+# TELEPROMPT_EMAIL_3="q13645947409@gmail.com"
+
+
+--- 文件路径: .env.example ---
+
+# ====================================================================
+# teleprompt-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并填入您的配置。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=sk-teleprompt-2api-default-key-please-change-me
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+# --- Teleprompt 凭证 (必须设置, 支持多账号轮询) ---
+# 请填入您的 email 地址。
+# 要启用多账号轮询，请按格式添加 TELEPROMPT_EMAIL_2, TELEPROMPT_EMAIL_3, ...
+# 程序会自动加载所有以 "TELEPROMPT_EMAIL_" 开头的环境变量。
+TELEPROMPT_EMAIL_1=""
+# TELEPROMPT_EMAIL_2="your_second_email@example.com"
+# TELEPROMPT_EMAIL_3="your_third_email@example.com"
+
+
+--- 文件路径: Dockerfile ---
+
+# ====================================================================
+# Dockerfile for teleprompt-2api (v1.0 - Credential Pool Edition)
+# ====================================================================
+
+FROM python:3.10-slim
+
+# 设置环境变量
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# 安装 Python 依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
+COPY . .
+
+# 创建并切换到非 root 用户
+RUN useradd --create-home appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# 暴露端口并启动 (使用 4 个 worker 以实现高并发)
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+
+
+--- 文件路径: docker-compose.yml ---
+
+services:
+  nginx:
+    image: nginx:latest
+    container_name: teleprompt-2api-nginx
+    restart: always
+    ports:
+      - "${NGINX_PORT:-8088}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    networks:
+      - teleprompt-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: teleprompt-2api-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - teleprompt-net
+
+networks:
+  teleprompt-net:
+    driver: bridge
+
+
+--- 文件路径: main.py ---
+
+import sys
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
+from fastapi.responses import JSONResponse, StreamingResponse
+from loguru import logger
+
+from app.core.config import settings
+from app.providers.teleprompt_provider import TelepromptProvider
+
+# --- 配置 Loguru ---
+logger.remove()
+logger.add(
+    sys.stdout,
+    level="INFO",
+    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}:{function}:{line}</cyan> - <level>{message}</level>",
+    colorize=True
+)
+
+provider = TelepromptProvider()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(f"应用启动中... {settings.APP_NAME} v{settings.APP_VERSION}")
+    logger.info(f"加载了 {len(settings.TELEPROMPT_EMAILS)} 个 Teleprompt 凭证。")
+    logger.info("服务已进入 'Intelligent Credential Pool' 模式。")
+    logger.info(f"服务将在 http://localhost:{settings.NGINX_PORT} 上可用")
+    yield
+    logger.info("应用关闭。")
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description=settings.DESCRIPTION,
+    lifespan=lifespan
+)
+
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    if settings.API_MASTER_KEY and settings.API_MASTER_KEY != "1":
+        if not authorization or "bearer" not in authorization.lower():
+            raise HTTPException(status_code=401, detail="需要 Bearer Token 认证。")
+        token = authorization.split(" ")[-1]
+        if token != settings.API_MASTER_KEY:
+            raise HTTPException(status_code=403, detail="无效的 API Key。")
+
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
+async def chat_completions(request: Request):
+    try:
+        request_data = await request.json()
+        return await provider.chat_completion(request_data)
+    except Exception as e:
+        logger.error(f"处理聊天请求时发生顶层错误: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+# --- [修正] 移除此处的密钥验证依赖 ---
+@app.get("/v1/models", response_class=JSONResponse)
+async def list_models():
+    """
+    提供模型列表端点，无需认证即可访问，以提高与第三方客户端的兼容性。
+    """
+    return await provider.get_models()
+
+@app.get("/", summary="根路径", include_in_schema=False)
+def root():
+    return {"message": f"欢迎来到 {settings.APP_NAME} v{settings.APP_VERSION}. 服务运行正常。"}
+
+
+
+--- 文件路径: nginx.conf ---
+
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream teleprompt_backend {
+        # 关键：使用 ip_hash 确保来自同一客户端的请求被转发到同一个 worker,
+        # 这对于保持多 worker 模式下凭证池轮询的正确性至关重要。
+        ip_hash;
+        server app:8000;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        location / {
+            proxy_pass http://teleprompt_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # 流式传输优化
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
+            chunked_transfer_encoding off;
+        }
+    }
+}
+
+
+--- 文件路径: requirements.txt ---
+
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-dotenv
+cloudscraper
+loguru
+
+
+--- 文件路径: app\core\__init__.py ---
+
+
+
+--- 文件路径: app\core\config.py ---
+
+import os
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import model_validator
+from typing import List, Optional
+
+from loguru import logger
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding='utf-8',
+        extra="ignore"
+    )
+
+    APP_NAME: str = "teleprompt-2api"
+    APP_VERSION: str = "1.0.0"
+    DESCRIPTION: str = "一个将 Teleprompt 提示词优化功能转换为兼容 OpenAI 格式 API 的高性能代理，支持多 Email 轮询。"
+
+    API_MASTER_KEY: Optional[str] = None
+    NGINX_PORT: int = 8088
+    API_REQUEST_TIMEOUT: int = 120
+
+    TELEPROMPT_EMAILS: List[str] = []
+
+    DEFAULT_MODEL: str = "prompt-optimizer"
+    KNOWN_MODELS: List[str] = ["prompt-optimizer"]
+
+    @model_validator(mode='after')
+    def load_credentials(self) -> 'Settings':
+        """
+        在设置加载后，从环境变量中动态收集所有 TELEPROMPT_EMAIL_...
+        """
+        i = 1
+        while True:
+            email = os.getenv(f"TELEPROMPT_EMAIL_{i}")
+            if email:
+                self.TELEPROMPT_EMAILS.append(email)
+                i += 1
+            else:
+                break
+        
+        if not self.TELEPROMPT_EMAILS:
+            logger.warning(
+                "在 .env 文件中未找到任何 'TELEPROMPT_EMAIL_...' 凭证。"
+                "服务将无法正常工作，除非至少配置一个 TELEPROMPT_EMAIL_1。"
+            )
+        return self
+
+settings = Settings()
+
+
+--- 文件路径: app\providers\__init__.py ---
+
+
+
+--- 文件路径: app\providers\base_provider.py ---
+
+from abc import ABC, abstractmethod
+from typing import Dict, Any
+from fastapi.responses import StreamingResponse, JSONResponse
+
+class BaseProvider(ABC):
+    @abstractmethod
+    async def chat_completion(
+        self,
+        request_data: Dict[str, Any]
+    ) -> StreamingResponse:
+        pass
+
+    @abstractmethod
+    async def get_models(self) -> JSONResponse:
+        pass
+
+
+--- 文件路径: app\providers\teleprompt_provider.py ---
+
+import json
+import time
+import uuid
+import asyncio
+from typing import Dict, Any, AsyncGenerator
+
+import cloudscraper
+from fastapi.responses import StreamingResponse, JSONResponse
+from loguru import logger
+
+from app.core.config import settings
+from app.providers.base_provider import BaseProvider
+from app.services.credential_manager import CredentialManager
+from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, DONE_CHUNK
+
+class TelepromptProvider(BaseProvider):
+    def __init__(self):
+        self.scraper = cloudscraper.create_scraper()
+        self.credential_manager = CredentialManager()
+        self.api_url = "https://teleprompt-v2-backend-production.up.railway.app/api/v1/prompt/optimize_auth"
+
+    async def chat_completion(self, request_data: Dict[str, Any]) -> StreamingResponse:
+        
+        async def stream_generator() -> AsyncGenerator[bytes, None]:
+            request_id = f"chatcmpl-{uuid.uuid4()}"
+            model = request_data.get("model", settings.DEFAULT_MODEL)
+            
+            try:
+                # 1. 从消息列表中获取最后一个用户输入
+                messages = request_data.get("messages", [])
+                last_user_message = next((m['content'] for m in reversed(messages) if m.get('role') == 'user'), None)
+                if not last_user_message:
+                    raise ValueError("在请求的 'messages' 列表中未找到用户消息。")
+
+                # 2. 从凭证池获取一个 email
+                email = self.credential_manager.get_credential()
+
+                # 3. 准备请求头和载荷
+                headers = self._prepare_headers(email)
+                payload = self._prepare_payload(last_user_message)
+                
+                logger.info(f"向上游发送请求, Email: ...{email[-10:]}")
+                
+                # 4. 发送请求 (cloudscraper 是同步库, FastAPI 会在线程池中运行它)
+                response = self.scraper.post(
+                    self.api_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=settings.API_REQUEST_TIMEOUT
+                )
+                response.raise_for_status()
+                response_data = response.json()
+                
+                logger.info(f"收到上游响应: {response_data}")
+
+                if not response_data.get("success") or "data" not in response_data:
+                    raise ValueError(f"上游 API 返回失败或格式不正确: {response_data}")
+
+                # 5. 提取优化后的文本
+                optimized_prompt = response_data["data"]
+
+                # 6. 使用伪流式生成器返回结果
+                chunk = create_chat_completion_chunk(request_id, model, optimized_prompt)
+                yield create_sse_data(chunk)
+                await asyncio.sleep(0.01) # 短暂停顿以模拟流式效果
+
+                # 7. 发送结束标志
+                final_chunk = create_chat_completion_chunk(request_id, model, "", "stop")
+                yield create_sse_data(final_chunk)
+                yield DONE_CHUNK
+                logger.success("伪流式响应成功完成。")
+
+            except Exception as e:
+                logger.error(f"处理流时发生错误: {e}", exc_info=True)
+                error_message = f"内部服务器错误: {str(e)}"
+                error_chunk = create_chat_completion_chunk(request_id, model, error_message, "stop")
+                yield create_sse_data(error_chunk)
+                yield DONE_CHUNK
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+    def _prepare_headers(self, email: str) -> Dict[str, str]:
+        return {
+            "accept": "*/*",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "content-type": "application/json",
+            "email": email,
+            "origin": "chrome-extension://alfpjlcndmeoainjfgbbnphcidpnmoae",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+        }
+
+    def _prepare_payload(self, text: str) -> Dict[str, Any]:
+        return {"text": text}
+
+    async def get_models(self) -> JSONResponse:
+        model_data = {
+            "object": "list",
+            "data": [
+                {"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"}
+                for name in settings.KNOWN_MODELS
+            ]
+        }
+        return JSONResponse(content=model_data)
+
+# BaseProvider 的抽象基类
+class BaseProvider:
+    async def chat_completion(self, request_data: Dict[str, Any]) -> StreamingResponse:
+        raise NotImplementedError
+    async def get_models(self) -> JSONResponse:
+        raise NotImplementedError
+
+
+--- 文件路径: app\services\credential_manager.py ---
+
+import threading
+from typing import Optional
+from loguru import logger
+
+from app.core.config import settings
+
+class CredentialManager:
+    """
+    一个线程安全的凭证管理器，用于轮询 Teleprompt 的 email 列表。
+    """
+    def __init__(self):
+        self.credentials = settings.TELEPROMPT_EMAILS
+        if not self.credentials:
+            raise ValueError("凭证列表为空。请在 .env 文件中配置至少一个 'TELEPROMPT_EMAIL_1'。")
+        self.lock = threading.Lock()
+        self.current_index = 0
+        logger.info(f"凭证管理器已初始化，共加载 {len(self.credentials)} 个凭证。")
+
+    def get_credential(self) -> str:
+        """
+        线程安全地获取下一个凭证。
+        """
+        with self.lock:
+            credential = self.credentials[self.current_index]
+            logger.info(f"使用凭证索引: {self.current_index}")
+            self.current_index = (self.current_index + 1) % len(self.credentials)
+            return credential
+
+
+--- 文件路径: app\utils\sse_utils.py ---
+
+import json
+import time
+from typing import Dict, Any, Optional
+
+DONE_CHUNK = b"data: [DONE]\n\n"
+
+def create_sse_data(data: Dict[str, Any]) -> bytes:
+    """将字典数据格式化为 SSE 事件字符串。"""
+    return f"data: {json.dumps(data)}\n\n".encode('utf-8')
+
+def create_chat_completion_chunk(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    创建一个与 OpenAI 兼容的聊天补全流式块。
+    """
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": finish_reason
+            }
+        ]
+    }
+
+
+
